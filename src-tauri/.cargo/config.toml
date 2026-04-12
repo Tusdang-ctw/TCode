@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+# Ensures Cargo uses MSVC link.exe, not Git's link.exe which shadows it.
+# If you still get "link: extra operand" errors, open a "Developer Command
+# Prompt for VS 2022" and run `cargo build` from there to get MSVC on PATH.
+linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"

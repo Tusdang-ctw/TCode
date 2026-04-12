@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TCode",
+  "version": "1.0.0",
+  "identifier": "com.personal.tcode",
+  "build": {
+    "beforeDevCommand": "npm run server:build && npm run vite:dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run vite:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TCode",
+        "width": 1600,
+        "height": 1000,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [],
+    "resources": [
+      "../dist-server/server.js",
+      "../node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+    ]
+  }
+}
