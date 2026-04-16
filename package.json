@@ -4,12 +4,13 @@
   "description": "Run multiple Claude Code agents simultaneously in a unified dashboard",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "node build-server.mjs && tauri dev",
     "build": "node build-server.mjs && tauri build",
     "vite:dev": "vite",
     "vite:build": "vite build",
     "server:build": "node build-server.mjs",
-    "server:dev": "tsx server/index.ts"
+    "server:dev": "tsx server/index.ts",
+    "dev:services": "concurrently \"npm run server:dev\" \"npm run vite:dev\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
@@ -19,6 +20,7 @@
     "@xterm/xterm": "^5.5.0",
     "better-sqlite3": "^12.8.0",
     "express": "^5.2.1",
+    "node-pty": "^1.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.20.0",
@@ -34,6 +36,7 @@
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.3.0",
     "autoprefixer": "^10.4.19",
+    "concurrently": "^9.2.1",
     "esbuild": "^0.28.0",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",

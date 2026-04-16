@@ -1,98 +1,145 @@
 import { create } from 'zustand'
-import { Agent, AgentStatus } from '../types'
+import { Agent } from '../types'
 
 const API = 'http://localhost:3131/api'
 
-interface AgentStore {
-  agents: Agent[]
-  loading: boolean
-  fetchAgents: () => Promise<void>
-  createAgent: (name: string, workingDir: string, safeMode?: boolean) => Promise<Agent>
-  updateAgent: (id: string, name: string, workingDir: string, safeMode?: boolean) => Promise<void>
-  toggleSafeMode: (id: string) => Promise<void>
-  removeAgent: (id: string) => Promise<void>
-  setStatus: (id: string, status: AgentStatus) => void
-  sendPrompt: (id: string, prompt: string) => Promise<void>
-  sendStdin: (id: string, input: string) => Promise<void>
-  stopAgent: (id: string) => Promise<void>
+export interface AgentWithStatus extends Agent {
+  ptyAlive: boolean
 }
 
-export const useAgentStore = create<AgentStore>((set, get) => ({
+interface AgentStore {
+  agents: AgentWithStatus[]
+  loading: boolean
+  error: string | null
+  serverConnected: boolean
+  setError: (msg: string | null) => void
+  fetchAgents: () => Promise<void>
+  createAgent: (name: string, workingDir: string, command: string) => Promise<AgentWithStatus>
+  updateAgent: (id: string, name: string, workingDir: string, command: string) => Promise<void>
+  removeAgent: (id: string) => Promise<void>
+  stopAgent: (id: string) => Promise<void>
+  restartAgent: (id: string, cols?: number, rows?: number) => Promise<void>
+  setPtyAlive: (id: string, alive: boolean) => void
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/** Wrap fetch calls with user-friendly error messages */
+async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (err) {
+    // Network error = server not reachable
+    throw new Error(
+      'Cannot reach backend server (localhost:3131). ' +
+      'Make sure Node.js is installed and the server is running.'
+    )
+  }
+}
+
+export const useAgentStore = create<AgentStore>((set) => ({
   agents: [],
   loading: false,
+  error: null,
+  serverConnected: false,
+
+  setError: (msg) => set({ error: msg }),
 
   fetchAgents: async () => {
-    set({ loading: true })
-    const res = await fetch(`${API}/agents`)
-    const agents: Agent[] = await res.json()
-    set({ agents, loading: false })
+    set({ loading: true, error: null })
+
+    // Retry up to 10 times — the Node.js server may still be starting
+    const MAX_RETRIES = 10
+    const RETRY_DELAY_MS = 800
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(`${API}/agents`)
+        if (!res.ok) throw new Error(`Server error: ${res.status}`)
+        const agents: AgentWithStatus[] = await res.json()
+        set({ agents, loading: false, serverConnected: true })
+        return
+      } catch {
+        if (attempt < MAX_RETRIES - 1) {
+          await sleep(RETRY_DELAY_MS)
+        }
+      }
+    }
+
+    set({
+      error: 'Cannot connect to backend server. Make sure Node.js is installed and the app is running correctly.',
+      loading: false,
+      serverConnected: false,
+    })
   },
 
-  createAgent: async (name, workingDir, safeMode = false) => {
-    const res = await fetch(`${API}/agents`, {
+  createAgent: async (name, workingDir, command) => {
+    const res = await apiFetch(`${API}/agents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, workingDir, safeMode }),
+      body: JSON.stringify({ name, workingDir, command }),
     })
-    const agent: Agent = await res.json()
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `Failed to create agent (HTTP ${res.status})`)
+    }
+    const agent: AgentWithStatus = await res.json()
     set((s) => ({ agents: [...s.agents, agent] }))
     return agent
   },
 
-  updateAgent: async (id, name, workingDir, safeMode) => {
-    const agent = get().agents.find((a) => a.id === id)
-    const res = await fetch(`${API}/agents/${id}`, {
+  updateAgent: async (id, name, workingDir, command) => {
+    const res = await apiFetch(`${API}/agents/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, workingDir, safeMode: safeMode ?? agent?.safeMode ?? false }),
+      body: JSON.stringify({ name, workingDir, command }),
     })
-    const updated: Agent = await res.json()
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `Failed to update agent (HTTP ${res.status})`)
+    }
+    const updated: AgentWithStatus = await res.json()
     set((s) => ({ agents: s.agents.map((a) => (a.id === id ? updated : a)) }))
   },
 
-  toggleSafeMode: async (id) => {
-    const agent = get().agents.find((a) => a.id === id)
-    if (!agent) return
-    const newVal = !agent.safeMode
-    // Optimistic update
-    set((s) => ({
-      agents: s.agents.map((a) => (a.id === id ? { ...a, safeMode: newVal } : a)),
-    }))
-    await fetch(`${API}/agents/${id}/safe-mode`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ safeMode: newVal }),
-    })
-  },
-
   removeAgent: async (id) => {
-    await fetch(`${API}/agents/${id}`, { method: 'DELETE' })
+    const res = await apiFetch(`${API}/agents/${id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `Failed to delete agent (HTTP ${res.status})`)
+    }
     set((s) => ({ agents: s.agents.filter((a) => a.id !== id) }))
   },
 
-  setStatus: (id, status) => {
+  stopAgent: async (id) => {
+    const res = await apiFetch(`${API}/agents/${id}/stop`, { method: 'POST' })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `Failed to stop agent (HTTP ${res.status})`)
+    }
     set((s) => ({
-      agents: s.agents.map((a) => (a.id === id ? { ...a, status } : a)),
+      agents: s.agents.map((a) => (a.id === id ? { ...a, ptyAlive: false } : a)),
     }))
   },
 
-  sendPrompt: async (id, prompt) => {
-    await fetch(`${API}/agents/${id}/prompt`, {
+  restartAgent: async (id, cols = 80, rows = 24) => {
+    const res = await apiFetch(`${API}/agents/${id}/restart`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ cols, rows }),
     })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `Failed to restart agent (HTTP ${res.status})`)
+    }
+    set((s) => ({
+      agents: s.agents.map((a) => (a.id === id ? { ...a, ptyAlive: true } : a)),
+    }))
   },
 
-  sendStdin: async (id, input) => {
-    await fetch(`${API}/agents/${id}/stdin`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input }),
-    })
-  },
-
-  stopAgent: async (id) => {
-    await fetch(`${API}/agents/${id}/stop`, { method: 'POST' })
+  setPtyAlive: (id, alive) => {
+    set((s) => ({
+      agents: s.agents.map((a) => (a.id === id ? { ...a, ptyAlive: alive } : a)),
+    }))
   },
 }))

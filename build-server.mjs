@@ -9,12 +9,13 @@ await build({
   platform: 'node',
   target: 'node18',
   format: 'cjs',
-  outfile: 'dist-server/server.js',
+  outfile: 'dist-server/server.cjs',
   external: [
     // Native addons must be kept external
     'better-sqlite3',
+    'node-pty',
   ],
   sourcemap: process.env.NODE_ENV !== 'production',
 })
 
-console.log('Server bundle written to dist-server/server.js')
+console.log('Server bundle written to dist-server/server.cjs')

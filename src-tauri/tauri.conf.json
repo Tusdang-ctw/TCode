@@ -22,16 +22,68 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* ws://localhost:* https://ipc.localhost; font-src 'self' data: asset: https://asset.localhost; img-src 'self' data: asset: https://asset.localhost"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "resources": [
-      "../dist-server/server.js",
-      "../node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+      "../dist-server/server.cjs",
+
+      "../node_modules/better-sqlite3/package.json",
+      "../node_modules/better-sqlite3/lib/index.js",
+      "../node_modules/better-sqlite3/lib/database.js",
+      "../node_modules/better-sqlite3/lib/sqlite-error.js",
+      "../node_modules/better-sqlite3/lib/util.js",
+      "../node_modules/better-sqlite3/lib/methods/aggregate.js",
+      "../node_modules/better-sqlite3/lib/methods/backup.js",
+      "../node_modules/better-sqlite3/lib/methods/function.js",
+      "../node_modules/better-sqlite3/lib/methods/inspect.js",
+      "../node_modules/better-sqlite3/lib/methods/pragma.js",
+      "../node_modules/better-sqlite3/lib/methods/serialize.js",
+      "../node_modules/better-sqlite3/lib/methods/table.js",
+      "../node_modules/better-sqlite3/lib/methods/transaction.js",
+      "../node_modules/better-sqlite3/lib/methods/wrappers.js",
+      "../node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+
+      "../node_modules/bindings/bindings.js",
+      "../node_modules/bindings/package.json",
+
+      "../node_modules/file-uri-to-path/index.js",
+      "../node_modules/file-uri-to-path/package.json",
+
+      "../node_modules/node-pty/package.json",
+      "../node_modules/node-pty/lib/index.js",
+      "../node_modules/node-pty/lib/interfaces.js",
+      "../node_modules/node-pty/lib/types.js",
+      "../node_modules/node-pty/lib/utils.js",
+      "../node_modules/node-pty/lib/terminal.js",
+      "../node_modules/node-pty/lib/eventEmitter2.js",
+      "../node_modules/node-pty/lib/unixTerminal.js",
+      "../node_modules/node-pty/lib/windowsTerminal.js",
+      "../node_modules/node-pty/lib/windowsPtyAgent.js",
+      "../node_modules/node-pty/lib/windowsConoutConnection.js",
+      "../node_modules/node-pty/lib/conpty_console_list_agent.js",
+      "../node_modules/node-pty/lib/shared/conout.js",
+      "../node_modules/node-pty/lib/worker/conoutSocketWorker.js",
+
+      "../node_modules/node-pty/prebuilds/win32-x64/conpty.node",
+      "../node_modules/node-pty/prebuilds/win32-x64/conpty_console_list.node",
+      "../node_modules/node-pty/prebuilds/win32-x64/pty.node",
+      "../node_modules/node-pty/prebuilds/win32-x64/winpty.dll",
+      "../node_modules/node-pty/prebuilds/win32-x64/winpty-agent.exe",
+      "../node_modules/node-pty/prebuilds/win32-x64/conpty/conpty.dll",
+      "../node_modules/node-pty/prebuilds/win32-x64/conpty/OpenConsole.exe",
+      "../node_modules/node-pty/build/Release/conpty/conpty.dll",
+      "../node_modules/node-pty/build/Release/conpty/OpenConsole.exe"
     ]
   }
 }

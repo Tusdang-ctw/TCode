@@ -1,22 +1,22 @@
 import { useState, useEffect } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
-import { Agent } from '../types'
+import { AgentWithStatus } from '../store/agentStore'
 
 interface Props {
-  agent?: Agent | null
-  onSave: (name: string, workingDir: string, safeMode: boolean) => void
+  agent?: AgentWithStatus | null
+  onSave: (name: string, workingDir: string, command: string) => void
   onClose: () => void
 }
 
 export function AgentModal({ agent, onSave, onClose }: Props) {
   const [name, setName] = useState(agent?.name ?? '')
   const [workingDir, setWorkingDir] = useState(agent?.workingDir ?? '')
-  const [safeMode, setSafeMode] = useState(agent?.safeMode ?? false)
+  const [command, setCommand] = useState(agent?.command ?? '')
 
   useEffect(() => {
     setName(agent?.name ?? '')
     setWorkingDir(agent?.workingDir ?? '')
-    setSafeMode(agent?.safeMode ?? false)
+    setCommand(agent?.command ?? '')
   }, [agent])
 
   const handleBrowse = async () => {
@@ -31,7 +31,7 @@ export function AgentModal({ agent, onSave, onClose }: Props) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim() || !workingDir.trim()) return
-    onSave(name.trim(), workingDir.trim(), safeMode)
+    onSave(name.trim(), workingDir.trim(), command.trim())
   }
 
   return (
@@ -77,30 +77,19 @@ export function AgentModal({ agent, onSave, onClose }: Props) {
             </div>
           </label>
 
-          {/* Safe Mode toggle */}
-          <div className="flex items-center justify-between bg-terminal-bg border border-terminal-border rounded-lg px-3 py-3">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-xs text-terminal-text font-semibold">Safe Mode</span>
-              <span className="text-xs text-terminal-muted">
-                {safeMode
-                  ? 'Claude will ask for confirmation before each action'
-                  : 'Claude auto-approves all actions (faster, no prompts)'}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setSafeMode((v) => !v)}
-              className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
-                safeMode ? 'bg-terminal-green' : 'bg-terminal-border'
-              }`}
-            >
-              <span
-                className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${
-                  safeMode ? 'translate-x-5' : 'translate-x-0'
-                }`}
-              />
-            </button>
-          </div>
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-terminal-muted uppercase tracking-wider">Startup Command</span>
+            <input
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder="e.g. npm run dev, claude, python app.py"
+              className="bg-terminal-bg border border-terminal-border rounded-lg px-3 py-2 text-terminal-text text-sm outline-none focus:border-terminal-blue transition-colors placeholder-terminal-muted"
+            />
+            <span className="text-xs text-terminal-muted mt-0.5">
+              Optional — runs automatically when the terminal starts
+            </span>
+          </label>
 
           <div className="flex justify-end gap-2 mt-1">
             <button

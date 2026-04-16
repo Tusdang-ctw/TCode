@@ -13,40 +13,71 @@ export const agentManager = new AgentManager()
 // WebSocket clients map: agentId -> Set<WebSocket>
 const subscribers = new Map<string, Set<WebSocket>>()
 
+/** Send a JSON control message to all subscribers of an agent. */
 function broadcast(agentId: string, msg: object) {
   const clients = subscribers.get(agentId)
   if (!clients) return
-  const payload = JSON.stringify(msg)
+  const json = JSON.stringify(msg)
   for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload)
+    if (ws.readyState === WebSocket.OPEN) ws.send(json)
   }
 }
 
-// Attach AgentManager events → WebSocket broadcasts
-agentManager.on('agent:data', ({ agentId, data }) => {
-  broadcast(agentId, { type: 'data', data })
+// Pipe raw PTY output to all subscribed WebSocket clients
+agentManager.on('pty:data', ({ agentId, data }) => {
+  const clients = subscribers.get(agentId)
+  if (!clients) return
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data)
+  }
 })
-agentManager.on('agent:json', ({ agentId, data }) => {
-  broadcast(agentId, { type: 'json', data })
+
+agentManager.on('pty:exit', ({ agentId, exitCode }) => {
+  broadcast(agentId, { type: 'exit', exitCode })
+  broadcast(agentId, { type: 'status', alive: false })
 })
-agentManager.on('agent:status', ({ agentId, status }) => {
-  broadcast(agentId, { type: 'status', status })
+
+// Send spawn errors to the terminal as visible red text
+agentManager.on('pty:error', ({ agentId, error }) => {
+  console.error(`[pty:error] Agent ${agentId}: ${error}`)
+  const msg = `\r\n\x1b[31m[Error: ${error}]\x1b[0m\r\n`
+  const clients = subscribers.get(agentId)
+  if (!clients) return
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg)
+  }
+  broadcast(agentId, { type: 'status', alive: false })
 })
-agentManager.on('agent:done', ({ agentId, code }) => {
-  broadcast(agentId, { type: 'done', code })
-})
-agentManager.on('agent:error', ({ agentId, data }) => {
-  broadcast(agentId, { type: 'data', data })
-})
+
 agentManager.on('agent:removed', ({ agentId }) => {
   subscribers.delete(agentId)
 })
+
+// Prevent the server from crashing on unhandled errors
+process.on('uncaughtException', (err) => {
+  console.error('[server] Uncaught exception (server kept alive):', err)
+})
+process.on('unhandledRejection', (err) => {
+  console.error('[server] Unhandled rejection (server kept alive):', err)
+})
+
+// Graceful shutdown: kill all PTY processes before exiting
+function shutdown() {
+  console.log('[server] Shutting down...')
+  for (const agent of agentManager.getAllAgents()) {
+    agentManager.killPty(agent.id)
+  }
+  process.exit(0)
+}
+
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
 
 export async function startServer(): Promise<void> {
   // Restore agents from DB
   const saved = dbOps.getAllAgents()
   for (const row of saved) {
-    agentManager.createAgent(row.id, row.name, row.working_dir, row.safe_mode === 1)
+    agentManager.createAgent(row.id, row.name, row.working_dir, row.command, row.created_at)
   }
 
   // ── Express REST API ──────────────────────────────────────────────
@@ -58,113 +89,163 @@ export async function startServer(): Promise<void> {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
     next()
   })
-  app.options('*', (_req, res) => res.sendStatus(200))
+  app.options('*splat', (_req, res) => res.sendStatus(200))
 
-  // GET /api/agents
+  // GET /api/agents — list all agents with PTY alive status
   app.get('/api/agents', (_req, res) => {
-    res.json(agentManager.getAllAgents())
+    try {
+      const agents = agentManager.getAllAgents().map((a) => ({
+        ...a,
+        ptyAlive: agentManager.isPtyAlive(a.id),
+      }))
+      res.json(agents)
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
   // POST /api/agents — create agent
   app.post('/api/agents', (req, res) => {
-    const { name, workingDir, safeMode = false } = req.body as { name: string; workingDir: string; safeMode?: boolean }
-    if (!name || !workingDir) return res.status(400).json({ error: 'name and workingDir required' })
-    const id = randomUUID()
-    const agent = agentManager.createAgent(id, name, workingDir, safeMode)
-    dbOps.saveAgent(id, name, workingDir, safeMode, agent.createdAt)
-    res.json(agent)
+    try {
+      const { name, workingDir, command } = req.body as { name: string; workingDir: string; command?: string }
+      if (!name || !workingDir) return res.status(400).json({ error: 'name and workingDir required' })
+      const id = randomUUID()
+      const cmd = command ?? ''
+      const agent = agentManager.createAgent(id, name, workingDir, cmd)
+      dbOps.saveAgent(id, name, workingDir, cmd, agent.createdAt)
+      res.json({ ...agent, ptyAlive: false })
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
-  // PUT /api/agents/:id — update name/workingDir/safeMode
+  // PUT /api/agents/:id — update name/workingDir/command
   app.put('/api/agents/:id', (req, res) => {
-    const { name, workingDir, safeMode } = req.body as { name?: string; workingDir?: string; safeMode?: boolean }
-    const agent = agentManager.getAgent(req.params.id)
-    if (!agent) return res.status(404).json({ error: 'Not found' })
-    const updated = agentManager.updateAgent(req.params.id, {
-      name: name ?? agent.name,
-      workingDir: workingDir ?? agent.workingDir,
-      safeMode: safeMode ?? agent.safeMode,
-    })
-    if (updated) dbOps.updateAgent(updated.id, updated.name, updated.workingDir, updated.safeMode)
-    res.json(updated)
+    try {
+      const { name, workingDir, command } = req.body as { name?: string; workingDir?: string; command?: string }
+      const agent = agentManager.getAgent(req.params.id)
+      if (!agent) return res.status(404).json({ error: 'Not found' })
+      const updated = agentManager.updateAgent(req.params.id, {
+        name: name ?? agent.name,
+        workingDir: workingDir ?? agent.workingDir,
+        command: command ?? agent.command,
+      })
+      if (updated) dbOps.updateAgent(updated.id, updated.name, updated.workingDir, updated.command)
+      res.json({ ...updated, ptyAlive: agentManager.isPtyAlive(req.params.id) })
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
   // DELETE /api/agents/:id
   app.delete('/api/agents/:id', (req, res) => {
-    agentManager.removeAgent(req.params.id)
-    dbOps.deleteAgent(req.params.id)
-    res.json({ ok: true })
+    try {
+      agentManager.removeAgent(req.params.id)
+      dbOps.deleteAgent(req.params.id)
+      res.json({ ok: true })
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
-  // POST /api/agents/:id/prompt — send prompt
-  app.post('/api/agents/:id/prompt', (req, res) => {
-    const { prompt } = req.body as { prompt: string }
-    if (!prompt) return res.status(400).json({ error: 'prompt required' })
-    const agent = agentManager.getAgent(req.params.id)
-    if (!agent) return res.status(404).json({ error: 'Not found' })
-    dbOps.savePrompt(req.params.id, prompt)
-    agentManager.sendPrompt(req.params.id, prompt)
-    res.json({ ok: true })
-  })
-
-  // POST /api/agents/:id/stdin — write to running process stdin (safe mode confirmations)
-  app.post('/api/agents/:id/stdin', (req, res) => {
-    const { input } = req.body as { input: string }
-    if (input === undefined) return res.status(400).json({ error: 'input required' })
-    const ok = agentManager.writeStdin(req.params.id, input)
-    res.json({ ok })
-  })
-
-  // PATCH /api/agents/:id/safe-mode — toggle safe mode without full edit
-  app.patch('/api/agents/:id/safe-mode', (req, res) => {
-    const { safeMode } = req.body as { safeMode: boolean }
-    const agent = agentManager.getAgent(req.params.id)
-    if (!agent) return res.status(404).json({ error: 'Not found' })
-    const updated = agentManager.updateAgent(req.params.id, { safeMode })
-    if (updated) dbOps.updateAgent(updated.id, updated.name, updated.workingDir, updated.safeMode)
-    res.json(updated)
-  })
-
-  // POST /api/agents/:id/stop
+  // POST /api/agents/:id/stop — kill the PTY without deleting the agent
   app.post('/api/agents/:id/stop', (req, res) => {
-    agentManager.stopAgent(req.params.id)
-    res.json({ ok: true })
+    try {
+      const agent = agentManager.getAgent(req.params.id)
+      if (!agent) return res.status(404).json({ error: 'Not found' })
+      agentManager.killPty(req.params.id)
+      res.json({ ok: true, ptyAlive: false })
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
-  // GET /api/agents/:id/history
-  app.get('/api/agents/:id/history', (req, res) => {
-    const history = dbOps.getHistory(req.params.id)
-    res.json(history)
+  // POST /api/agents/:id/restart — kill + respawn PTY
+  app.post('/api/agents/:id/restart', (req, res) => {
+    try {
+      const agent = agentManager.getAgent(req.params.id)
+      if (!agent) return res.status(404).json({ error: 'Not found' })
+      const { cols, rows } = req.body as { cols?: number; rows?: number }
+      agentManager.restartPty(req.params.id, cols ?? 80, rows ?? 24)
+      const alive = agentManager.isPtyAlive(req.params.id)
+      broadcast(req.params.id, { type: 'status', alive })
+      res.json({ ok: true, ptyAlive: alive })
+    } catch (e) { res.status(500).json({ error: String(e) }) }
   })
 
+  // ── Start HTTP server with port conflict detection ────────────────
   const httpServer = http.createServer(app)
+
+  httpServer.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`[server] Port ${PORT_HTTP} already in use. Is another instance of TCode running?`)
+      process.exit(1)
+    }
+    throw e
+  })
+
   httpServer.listen(PORT_HTTP, () => {
     console.log(`[server] HTTP listening on :${PORT_HTTP}`)
   })
 
-  // ── WebSocket server ──────────────────────────────────────────────
+  // ── WebSocket server with port conflict detection ─────────────────
   const wss = new WebSocketServer({ port: PORT_WS })
 
+  wss.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`[server] WebSocket port ${PORT_WS} already in use. Is another instance of TCode running?`)
+      process.exit(1)
+    }
+    throw e
+  })
+
   wss.on('connection', (ws, req) => {
-    const url = new URL(req.url ?? '/', `http://localhost`)
-    const agentId = url.searchParams.get('agentId')
-    if (!agentId) {
-      ws.close(1008, 'agentId required')
-      return
+    try {
+      const url = new URL(req.url ?? '/', `http://localhost`)
+      const agentId = url.searchParams.get('agentId')
+      if (!agentId) {
+        ws.close(1008, 'agentId required')
+        return
+      }
+
+      // Validate agent exists
+      if (!agentManager.getAgent(agentId)) {
+        ws.close(1008, 'Agent not found')
+        return
+      }
+
+      const cols = parseInt(url.searchParams.get('cols') ?? '80', 10)
+      const rows = parseInt(url.searchParams.get('rows') ?? '24', 10)
+
+      // Subscribe this client
+      if (!subscribers.has(agentId)) subscribers.set(agentId, new Set())
+      subscribers.get(agentId)!.add(ws)
+
+      // Spawn PTY if not already alive (spawnPty handles errors internally)
+      agentManager.spawnPty(agentId, cols, rows)
+
+      // Send initial status so the client knows the PTY state
+      ws.send(JSON.stringify({ type: 'status', alive: agentManager.isPtyAlive(agentId) }))
+
+      // Handle incoming messages from client
+      ws.on('message', (raw: Buffer | string) => {
+        const str = raw.toString()
+        try {
+          const msg = JSON.parse(str)
+          if (msg.type === 'resize' && typeof msg.cols === 'number' && typeof msg.rows === 'number') {
+            agentManager.resizePty(agentId, msg.cols, msg.rows)
+            return
+          }
+        } catch {
+          // Not JSON — treat as raw terminal input
+        }
+        agentManager.write(agentId, str)
+      })
+
+      ws.on('close', () => {
+        subscribers.get(agentId)?.delete(ws)
+      })
+    } catch (err) {
+      console.error('[server] WebSocket connection handler error:', err)
+      try { ws.close(1011, 'Internal error') } catch { /* ignore */ }
     }
-
-    if (!subscribers.has(agentId)) subscribers.set(agentId, new Set())
-    subscribers.get(agentId)!.add(ws)
-
-    const agent = agentManager.getAgent(agentId)
-    if (agent) {
-      ws.send(JSON.stringify({ type: 'status', status: agent.status }))
-    }
-
-    ws.on('close', () => {
-      subscribers.get(agentId)?.delete(ws)
-    })
   })
 
   console.log(`[server] WebSocket listening on :${PORT_WS}`)
 }
+
+// Auto-invoke on module load
+startServer().catch((err) => {
+  console.error('[server] Fatal startup error:', err)
+  process.exit(1)
+})

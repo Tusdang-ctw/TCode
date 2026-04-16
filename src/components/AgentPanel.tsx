@@ -2,160 +2,243 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { Agent } from '../types'
-import { useAgentStore } from '../store/agentStore'
-import { useAgentSocket } from '../hooks/useAgentSocket'
+import { AgentWithStatus } from '../store/agentStore'
 
-const STATUS_COLOR: Record<string, string> = {
-  idle: 'bg-terminal-green',
-  running: 'bg-terminal-yellow animate-pulse',
-  error: 'bg-terminal-red',
-  stopped: 'bg-terminal-muted',
-}
+const WS_URL = 'ws://localhost:3132'
+const MAX_RECONNECT_ATTEMPTS = 15
+const BASE_RECONNECT_DELAY_MS = 1000
 
 interface Props {
-  agent: Agent
+  agent: AgentWithStatus
   onRemove: (id: string) => void
-  onEdit: (agent: Agent) => void
+  onEdit: (agent: AgentWithStatus) => void
+  onStop: (id: string) => void
+  onRestart: (id: string, cols: number, rows: number) => void
+  onPtyStatus: (id: string, alive: boolean) => void
 }
 
-export function AgentPanel({ agent, onRemove, onEdit }: Props) {
-  const { sendPrompt, sendStdin, stopAgent, toggleSafeMode } = useAgentStore()
-  const termRef = useRef<HTMLDivElement>(null)
-  const [terminal, setTerminal] = useState<Terminal | null>(null)
-  const fitAddonRef = useRef<FitAddon | null>(null)
-  const [prompt, setPrompt] = useState('')
-  const [stdinInput, setStdinInput] = useState('')
-  const [history, setHistory] = useState<string[]>([])
-  const [historyIdx, setHistoryIdx] = useState(-1)
+export function AgentPanel({ agent, onRemove, onEdit, onStop, onRestart, onPtyStatus }: Props) {
+  const termContainerRef = useRef<HTMLDivElement>(null)
+  const termRef = useRef<Terminal | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const fitRef = useRef<FitAddon | null>(null)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectAttemptsRef = useRef(0)
+  const mountedRef = useRef(true)
 
-  useAgentSocket(agent.id, terminal)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   useEffect(() => {
-    if (!termRef.current) return
+    mountedRef.current = true
+    const container = termContainerRef.current
+    if (!container) return
 
+    // Create xterm.js terminal
     const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
+      fontSize: 13,
       theme: {
         background: '#0d1117',
         foreground: '#e6edf3',
         cursor: '#58a6ff',
         selectionBackground: '#264f78',
         black: '#0d1117',
-        brightBlack: '#8b949e',
         red: '#f85149',
         green: '#3fb950',
         yellow: '#d29922',
         blue: '#58a6ff',
         magenta: '#bc8cff',
-        cyan: '#39c5cf',
+        cyan: '#76e3ea',
         white: '#e6edf3',
+        brightBlack: '#8b949e',
+        brightRed: '#f85149',
+        brightGreen: '#3fb950',
+        brightYellow: '#d29922',
+        brightBlue: '#58a6ff',
+        brightMagenta: '#bc8cff',
+        brightCyan: '#76e3ea',
         brightWhite: '#ffffff',
       },
-      fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
-      fontSize: 12,
-      lineHeight: 1.4,
-      cursorBlink: false,
-      disableStdin: true,
-      scrollback: 5000,
     })
 
-    const fitAddon = new FitAddon()
-    fitAddonRef.current = fitAddon
-    term.loadAddon(fitAddon)
-    term.open(termRef.current)
-    fitAddon.fit()
+    const fit = new FitAddon()
+    term.loadAddon(fit)
+    term.open(container)
+    fit.fit()
 
-    term.writeln('\x1b[2m\x1b[36m── TCode ──\x1b[0m')
-    term.writeln(`\x1b[2mAgent: \x1b[0m\x1b[1m${agent.name}\x1b[0m`)
-    term.writeln(`\x1b[2mDir:   \x1b[0m${agent.workingDir}`)
-    term.writeln(`\x1b[2mMode:  \x1b[0m${agent.safeMode ? '\x1b[33mSafe (confirmations on)\x1b[0m' : '\x1b[32mAuto-approve\x1b[0m'}`)
-    term.writeln('')
+    termRef.current = term
+    fitRef.current = fit
 
-    setTerminal(term)
+    // Track the current onData disposable so we can rewire it on reconnect
+    let dataDisposable: { dispose(): void } | null = null
 
-    const ro = new ResizeObserver(() => fitAddon.fit())
-    ro.observe(termRef.current)
+    function connectWebSocket() {
+      if (!mountedRef.current) return
+
+      const { cols, rows } = termRef.current ?? { cols: 80, rows: 24 }
+      const ws = new WebSocket(
+        `${WS_URL}/?agentId=${agent.id}&cols=${cols}&rows=${rows}`
+      )
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        reconnectAttemptsRef.current = 0
+      }
+
+      ws.onmessage = (event) => {
+        const data = event.data as string
+        // Check for control messages
+        if (data.startsWith('{')) {
+          try {
+            const msg = JSON.parse(data)
+            if (msg.type === 'exit') {
+              termRef.current?.writeln(
+                `\r\n\x1b[31m[Shell exited with code ${msg.exitCode}]\x1b[0m`
+              )
+              onPtyStatus(agent.id, false)
+              return
+            }
+            if (msg.type === 'status') {
+              onPtyStatus(agent.id, msg.alive)
+              return
+            }
+          } catch {
+            // Not valid JSON, treat as terminal data
+          }
+        }
+        termRef.current?.write(data)
+      }
+
+      ws.onerror = () => {
+        // onclose will fire after this — reconnect logic lives there
+      }
+
+      ws.onclose = () => {
+        // Clean up the previous onData listener
+        dataDisposable?.dispose()
+        dataDisposable = null
+
+        if (!mountedRef.current) return
+
+        // Exponential backoff reconnect
+        if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+          const delay = Math.min(
+            BASE_RECONNECT_DELAY_MS * Math.pow(1.5, reconnectAttemptsRef.current),
+            10000
+          )
+          reconnectAttemptsRef.current++
+          reconnectTimerRef.current = setTimeout(connectWebSocket, delay)
+        } else {
+          termRef.current?.writeln(
+            '\r\n\x1b[31m[Connection lost — max reconnect attempts reached]\x1b[0m'
+          )
+        }
+      }
+
+      // Forward keystrokes to PTY via WebSocket
+      dataDisposable = term.onData((data) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data)
+        }
+      })
+    }
+
+    // Initial connection
+    connectWebSocket()
+
+    // Handle resize: observe container and update PTY dimensions
+    const resizeObserver = new ResizeObserver(() => {
+      try {
+        fit.fit()
+        const ws = wsRef.current
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })
+          )
+        }
+      } catch {
+        // Ignore resize errors during teardown
+      }
+    })
+    resizeObserver.observe(container)
 
     return () => {
-      ro.disconnect()
+      mountedRef.current = false
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+      resizeObserver.disconnect()
+      dataDisposable?.dispose()
+      const ws = wsRef.current
+      if (ws) {
+        ws.onclose = null
+        ws.close()
+      }
       term.dispose()
+      termRef.current = null
+      wsRef.current = null
+      fitRef.current = null
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [agent.id])
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    const p = prompt.trim()
-    if (!p || agent.status === 'running') return
-    terminal?.writeln(`\r\n\x1b[36m\x1b[1m> ${p}\x1b[0m\r\n`)
-    setHistory((h) => [p, ...h.slice(0, 99)])
-    setHistoryIdx(-1)
-    setPrompt('')
-    await sendPrompt(agent.id, p)
+  const handleStop = () => {
+    onStop(agent.id)
   }
 
-  const handleStdinSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    const val = stdinInput.trim()
-    if (!val) return
-    terminal?.writeln(`\r\n\x1b[35m↳ ${val}\x1b[0m`)
-    setStdinInput('')
-    await sendStdin(agent.id, val)
+  const handleRestart = () => {
+    const term = termRef.current
+    const cols = term?.cols ?? 80
+    const rows = term?.rows ?? 24
+    // Clear the terminal for a fresh start
+    term?.clear()
+    onRestart(agent.id, cols, rows)
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'ArrowUp') {
-      const idx = Math.min(historyIdx + 1, history.length - 1)
-      setHistoryIdx(idx)
-      setPrompt(history[idx] ?? '')
-      e.preventDefault()
-    } else if (e.key === 'ArrowDown') {
-      const idx = Math.max(historyIdx - 1, -1)
-      setHistoryIdx(idx)
-      setPrompt(idx === -1 ? '' : history[idx])
-      e.preventDefault()
+  const handleDelete = () => {
+    if (!confirmingDelete) {
+      setConfirmingDelete(true)
+      // Auto-cancel after 3 seconds
+      setTimeout(() => setConfirmingDelete(false), 3000)
+      return
     }
+    onRemove(agent.id)
   }
-
-  const clearTerminal = () => terminal?.clear()
-
-  const safeModeColor = agent.safeMode
-    ? 'text-terminal-yellow border-terminal-yellow/40 bg-terminal-yellow/10'
-    : 'text-terminal-muted border-terminal-border bg-transparent'
 
   return (
     <div className="flex flex-col bg-terminal-panel border border-terminal-border rounded-lg overflow-hidden h-full">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-terminal-border bg-terminal-bg/50 gap-2 flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${STATUS_COLOR[agent.status]}`} />
-          <span className="font-mono text-sm font-semibold text-terminal-text truncate">{agent.name}</span>
-          <span className="font-mono text-xs text-terminal-muted truncate hidden sm:block">{agent.workingDir}</span>
+          {/* Live status dot */}
+          <span
+            className={`w-2 h-2 rounded-full flex-shrink-0 transition-colors ${
+              agent.ptyAlive ? 'bg-terminal-green' : 'bg-terminal-red'
+            }`}
+            title={agent.ptyAlive ? 'Terminal running' : 'Terminal stopped'}
+          />
+          <span className="font-mono text-sm font-semibold text-terminal-text truncate">
+            {agent.name}
+          </span>
+          <span className="font-mono text-xs text-terminal-muted truncate hidden sm:block">
+            {agent.workingDir}
+          </span>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
-          {/* Safe Mode quick toggle */}
-          <button
-            onClick={() => toggleSafeMode(agent.id)}
-            title={agent.safeMode ? 'Safe Mode ON — click to disable' : 'Safe Mode OFF — click to enable'}
-            className={`px-2 py-1 text-xs border rounded font-mono transition-colors ${safeModeColor} hover:opacity-80`}
-          >
-            {agent.safeMode ? '🔒 safe' : '⚡ auto'}
-          </button>
-
-          <button
-            onClick={clearTerminal}
-            title="Clear terminal"
-            className="px-2 py-1 text-xs text-terminal-muted hover:text-terminal-text rounded hover:bg-terminal-border transition-colors font-mono"
-          >
-            clr
-          </button>
-          {agent.status === 'running' && (
+          {/* Stop / Restart */}
+          {agent.ptyAlive ? (
             <button
-              onClick={() => stopAgent(agent.id)}
-              title="Stop agent"
-              className="px-2 py-1 text-xs text-terminal-red hover:bg-terminal-red/10 rounded transition-colors font-mono"
+              onClick={handleStop}
+              title="Stop terminal"
+              className="px-2 py-1 text-xs text-terminal-muted hover:text-terminal-yellow rounded hover:bg-terminal-yellow/10 transition-colors font-mono"
             >
               stop
+            </button>
+          ) : (
+            <button
+              onClick={handleRestart}
+              title="Restart terminal"
+              className="px-2 py-1 text-xs text-terminal-muted hover:text-terminal-green rounded hover:bg-terminal-green/10 transition-colors font-mono"
+            >
+              start
             </button>
           )}
           <button
@@ -166,63 +249,21 @@ export function AgentPanel({ agent, onRemove, onEdit }: Props) {
             edit
           </button>
           <button
-            onClick={() => onRemove(agent.id)}
-            title="Remove agent"
-            className="px-2 py-1 text-xs text-terminal-muted hover:text-terminal-red rounded hover:bg-terminal-red/10 transition-colors font-mono"
+            onClick={handleDelete}
+            title={confirmingDelete ? 'Click again to confirm' : 'Remove agent'}
+            className={`px-2 py-1 text-xs rounded transition-colors font-mono ${
+              confirmingDelete
+                ? 'bg-terminal-red/20 text-terminal-red border border-terminal-red/40'
+                : 'text-terminal-muted hover:text-terminal-red hover:bg-terminal-red/10'
+            }`}
           >
-            ✕
+            {confirmingDelete ? 'confirm?' : '\u2715'}
           </button>
         </div>
       </div>
 
-      {/* Terminal */}
-      <div ref={termRef} className="flex-1 overflow-hidden p-1" />
-
-      {/* Stdin input — only shown in safe mode while running */}
-      {agent.safeMode && agent.status === 'running' && (
-        <form
-          onSubmit={handleStdinSubmit}
-          className="flex gap-2 px-2 py-1.5 border-t border-terminal-yellow/30 bg-terminal-yellow/5 flex-shrink-0"
-        >
-          <span className="font-mono text-terminal-yellow text-xs self-center flex-shrink-0">confirm:</span>
-          <input
-            type="text"
-            value={stdinInput}
-            onChange={(e) => setStdinInput(e.target.value)}
-            placeholder='Type "y" or "n" and press Enter…'
-            autoFocus
-            className="flex-1 bg-transparent font-mono text-xs text-terminal-text placeholder-terminal-muted outline-none"
-          />
-          <button
-            type="submit"
-            disabled={!stdinInput.trim()}
-            className="px-2 py-1 text-xs font-mono bg-terminal-yellow/20 text-terminal-yellow border border-terminal-yellow/30 rounded hover:bg-terminal-yellow/30 transition-colors disabled:opacity-40"
-          >
-            send
-          </button>
-        </form>
-      )}
-
-      {/* Prompt input */}
-      <form onSubmit={handleSubmit} className="flex gap-2 p-2 border-t border-terminal-border bg-terminal-bg/30 flex-shrink-0">
-        <span className="font-mono text-terminal-blue text-sm flex-shrink-0 self-center">❯</span>
-        <input
-          type="text"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={agent.status === 'running' ? 'Agent is running…' : 'Enter prompt and press Enter…'}
-          disabled={agent.status === 'running'}
-          className="flex-1 bg-transparent font-mono text-sm text-terminal-text placeholder-terminal-muted outline-none disabled:opacity-50"
-        />
-        <button
-          type="submit"
-          disabled={agent.status === 'running' || !prompt.trim()}
-          className="px-3 py-1 text-xs font-mono bg-terminal-blue/20 text-terminal-blue border border-terminal-blue/30 rounded hover:bg-terminal-blue/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
-        >
-          run
-        </button>
-      </form>
+      {/* xterm.js Terminal */}
+      <div ref={termContainerRef} className="flex-1 min-h-0" />
     </div>
   )
 }
